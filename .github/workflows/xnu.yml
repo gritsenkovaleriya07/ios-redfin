@@ -18,6 +18,9 @@ on:
       clean:
         description: ignore the incremental build cache (full build)
         default: "false"
+      runner:
+        description: runner label (macos-15-intel, macos-15, macos-26)
+        default: macos-15-intel
   push:
     branches: [main, redfin]
     paths:
@@ -43,7 +46,8 @@ jobs:
     # macos-14 shipped Xcode 15.x (iig matching the xnu-8796 IORPC ABI), but GitHub no longer offers it
     # ("macos-14-arm64-us-default is not supported", 2026-11). macos-15 has Xcode 16: its iig emits
     # IORPC.kernelContent, which patch 0082 adds to this xnu. The Deps step picks the oldest Xcode installed.
-    runs-on: macos-15
+    # Default macos-15-intel (same Xcode 16 set; its own runner pool): the arm64 kernel cross-builds there.
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
