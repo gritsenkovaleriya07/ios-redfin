@@ -1,0 +1,124 @@
+Subject: [PATCH] 1202 bramble: sofef01 panel (one pipe, no DSC, 60 Hz only)
+
+Bramble's Samsung sofef01 (live DT qcom,mdss_dsi_sofef01_sdc_1080p_cmd: dsi_cmd_mode, 1080x2340, 60 Hz,
+topology 1 LM / 0 DSC / 1 INTF, bl_ctrl_dcs 4..1023) in place of redfin's S6E3HC2 (DSC 2x540, 60/90 Hz):
+
+- sweet_gpu.c: count the pipes ABL lit (VIG1 only with a non-zero SRC_SIZE); panel stride, flip and the
+  CTL0 flush touch only those (redfin: VIG0 + VIG1, flush 0x3).
+- SweetSurface.cpp: sweetscanout absent = 0 (blit); direct scanout scales into two 540-wide pipes.
+- SweetFramebuffer.cpp: setHz refuses 90 (sofef01's DCS 0x53 is brightness control, not a rate switch).
+
+Brightness needs no change: DCS 0x51, 10 bits MSB first, 4..1023 and 500 nits max (Android's HDR caps) as
+redfin's 0906/0973.
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e7631df..fd50d81 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1108,14 +1108,41 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_tlb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
+ #define SSPP_VIG(n)     (MDP + 0x5000 + 0x2000ULL * (n))
+ #define SSPP_YSTRIDE0   0x24
+ #define CTL0_FLUSH      (MDP + 0x2000 + 0x18)
++#define SSPP_SRC_SIZE   0x00
++
++/*
++ * redfin: ABL scans out through VIG0 + VIG1 (540 columns each: the S6E3HC2 runs DSC 2x540); autorefresh picks a
++ * flushed change up.
++ * bramble (1202): the sofef01 runs without DSC on one layer mixer (live DT qcom,display-topology <1 0 1>), so ABL
++ * lights one pipe, as on sunfish (same panel: VIG0). panel_pipes() counts the pipes ABL left running (VIG1 only
++ * with a non-zero SRC_SIZE); stride, flip and flush touch only those. CTL flush bits: VIG0 = 0, VIG1 = 1.
++ */
++static uint32_t
++panel_pipes(void)
++{
++	static uint32_t pipes;
++	if (pipes == 0) {
++		uint32_t s0 = a6_rd(SSPP_VIG(0) + SSPP_SRC_SIZE), s1 = a6_rd(SSPP_VIG(1) + SSPP_SRC_SIZE);
++		pipes = s1 != 0 ? 2 : 1;
++		a6_log("panel: %u pipe(s) from ABL (vig0 %ux%u, vig1 %ux%u)\n", pipes, s0 & 0xffff, s0 >> 16,
++		    s1 & 0xffff, s1 >> 16);
++	}
++	return pipes;
++}
++
++static uint32_t
++panel_flush_bits(void)
++{
++	return panel_pipes() == 2 ? 0x3 : 0x1;
++}
+ 
+-/* ABL scans out through VIG0 + VIG1 (540 columns each); autorefresh picks a flushed change up. */
+ void
+ sweet_gpu_panel_stride(uint32_t stride)
+ {
+-	a6_wr(SSPP_VIG(0) + SSPP_YSTRIDE0, stride);
+-	a6_wr(SSPP_VIG(1) + SSPP_YSTRIDE0, stride);
+-	a6_wr(CTL0_FLUSH, 0x3);
++	for (uint32_t p = 0; p < panel_pipes(); p++) {
++		a6_wr(SSPP_VIG(p) + SSPP_YSTRIDE0, stride);
++	}
++	a6_wr(CTL0_FLUSH, panel_flush_bits());
+ 	a6_log("panel stride %u\n", stride);
+ }
+ 
+@@ -1154,7 +1181,7 @@ fb_flip_on(void)
+ static bool
+ flip_latched_locked(void)
+ {
+-	if (!flip_abs || !(a6_rd(CTL0_FLUSH) & 0x3)) {
++	if (!flip_abs || !(a6_rd(CTL0_FLUSH) & panel_flush_bits())) {
+ 		return true;
+ 	}
+ 	uint64_t ns;
+@@ -1174,11 +1201,11 @@ flip_to_locked(uint32_t buf)
+ 		return;         /* 0948: the pipes show a test pattern; p mdp restore puts this buffer back */
+ 	}
+ 	uint64_t from = A6_FB_PA + scan_buf * A6_FB_BUF_OFF, to = A6_FB_PA + buf * A6_FB_BUF_OFF;
+-	for (uint32_t p = 0; p < 2; p++) {
++	for (uint32_t p = 0; p < panel_pipes(); p++) {     /* 1202: only the pipes ABL lit */
+ 		uint32_t a = a6_rd(SSPP_VIG(p) + SSPP_SRC0_ADDR);
+ 		a6_wr(SSPP_VIG(p) + SSPP_SRC0_ADDR, (uint32_t)(a - (uint32_t)from + (uint32_t)to));
+ 	}
+-	a6_wr(CTL0_FLUSH, 0x3);
++	a6_wr(CTL0_FLUSH, panel_flush_bits());
+ 	flip_abs = mach_absolute_time();
+ 	scan_buf = buf;
+ 	if (stat_flips++ < 3) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cff6603..8358606 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2407,7 +2407,14 @@ sweet_fb_vsync_lock(int on)
+ bool
+ AppleCLCD::setHz(uint32_t hz, bool tc)
+ {
+-	if (hz != 60 && hz != 90) {
++	/*
++	 * bramble (1202): the sofef01 is a 60 Hz panel (live DT: one timing, qcom,mdss-dsi-panel-framerate 60), and its
++	 * DCS 0x53 is WRCTRLD (brightness control: its HBM and dimming commands write 0x53 0x28/0xe8), not a rate
++	 * switch, so the S6E3HC2's 0x53 0x38 must never go out. 60 is accepted (and sent as 0x53 0x28, the panel's
++	 * normal brightness-control value); 90 is refused, and sweetfb_hz=90 falls back to 60 Hz below.
++	 */
++	if (hz != 60) {
++		IOLog("SWEET FB: hz %u refused: bramble's sofef01 runs at 60 Hz only\n", hz);
+ 		return false;
+ 	}
+ 	if (fDsi == NULL) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1a56380..1d567df 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -109,7 +109,12 @@ sweet_surface_scan_mode(void)
+ 		 * on by itself at the first swap of a scanout-slot surface (AppleCLCD::swap, sweet_scan_auto); 3 slots only
+ 		 * (direct off until p scanout 1: what 2 was before 1046).
+ 		 */
+-		int m = 2;
++		/*
++		 * bramble (1202): absent = 0. Direct scanout (0975-0986) scales CA's 1125x2436 surface into two 540-wide
++		 * pipes (the S6E3HC2's DSC halves); bramble's sofef01 has one pipe and no DSC, so the blit path is the
++		 * default until direct scanout learns one pipe. sweetscanout=N still picks a mode by hand.
++		 */
++		int m = 0;
+ 		PE_parse_boot_argn("sweetscanout", &m, sizeof(m));
+ 		sweet_scan_boot = m < 0 ? 0 : m;
+ 	}

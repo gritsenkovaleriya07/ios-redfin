@@ -26,10 +26,12 @@ HIGH_PHYS_BASE = 0x100000000
 # 0x100000000-0x27ec00000 (6 GiB - 20 MiB); the log stashes sit above it (LOGSTASH_*, shim/ramlog.c, sweet_ufs.c 1033)
 # and 0x27fc00000-0x280000000 is never touched (Linux's top-of-RAM reserved pages; ABL may use it).
 # Was 0xf8c00000 (sunfish's 6 GB phone: RAM ends 0x1fcc00000): 2 GiB of the Pixel 5 sat unused.
-HIGH_MEM_SIZE = 0x17ec00000
-PANIC_LOG_PA_REDFIN = 0x27f000000   # pram, 512 KiB
-MIRROR_PA_REDFIN = 0x27f200000      # sweet_ufs.c SWEET_MIRROR_PA: 4 KiB header + 4 MiB ring
-MAILBOX_PA_REDFIN = 0x27f800000     # shim/ramlog.c MAILBOX_PA
+# bramble (Pixel 4a 5G, live DT /memory): 0x80000000+0x3cc00000, 0xc0000000+1G, 0x100000000+4G: RAM ends
+# 0x200000000. Same layout as redfin moved down by 0x80000000: XNU 0x100000000-0x1fec00000, stashes above it.
+HIGH_MEM_SIZE = 0xfec00000
+PANIC_LOG_PA_REDFIN = 0x1ff000000   # pram, 512 KiB
+MIRROR_PA_REDFIN = 0x1ff200000      # sweet_ufs.c SWEET_MIRROR_PA: 4 KiB header + 4 MiB ring
+MAILBOX_PA_REDFIN = 0x1ff800000     # shim/ramlog.c MAILBOX_PA
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -286,7 +288,7 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backl
     ])
 
     # iBoot's panic region (pe_init.c check_for_panic_log): RAM above XNU's range
-    # (which ends at 0x27ec00000 on redfin since 1033) and below the console mirror at 0x27f200000.
+    # (which ends at 0x1fec00000 on bramble) and below the console mirror at 0x1ff200000.
     pram = node('pram', [ph(), ('reg', struct.pack('<2Q', PANIC_LOG_PA, PANIC_LOG_SIZE))])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).

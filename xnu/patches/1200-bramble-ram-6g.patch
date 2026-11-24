@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -924,8 +924,13 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+  * above 4 GiB, mkadt.py HIGH_MEM_SIZE), so the sunfish address 0x1fa000000 is
+  * XNU-managed RAM: the mirror moves to 0x27f200000 (pram 0x27f000000, shim
+  * mailbox 0x27f800000; 0x27fc00000-0x280000000 is left untouched).
++ *
++ * bramble (1200): the Pixel 4a 5G has 6 GB; live DT /memory ends at
++ * 0x200000000 (bank 0x100000000 + 4 GiB). XNU takes 0x100000000-0x1fec00000,
++ * the stashes move down by 0x80000000: pram 0x1ff000000, mirror 0x1ff200000,
++ * shim mailbox 0x1ff800000; 0x1ffc00000-0x200000000 is left untouched.
+  */
+-#define SWEET_MIRROR_PA         0x27f200000ULL
++#define SWEET_MIRROR_PA         0x1ff200000ULL
+ struct sweet_mirror_header {
+ 	char magic[8];
+ 	uint64_t total;

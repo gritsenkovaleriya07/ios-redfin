@@ -1,0 +1,220 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 33231ca..2ccbf92 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -10,6 +10,15 @@
+  * runs under XNU, so the AP simply takes it (switch GPIO 126 low).
+  * Boot-args: flametouch=0 off, flametouchdelay=N start after N s,
+  * flametouchlog=1 log every event.
++ *
++ * bramble (Pixel 4a 5G, 1201): the same ST FTS IC, on lito's wiring, which is
++ * redfin's sec_ts wiring pin for pin (live DT spi@880000/touchscreen@0,
++ * compatible "st,fts"): QUPv3 wrap0 SE0, SPI pins 42-45 (EAST, qup00), bus
++ * switch 35 (EAST), reset 8 and attention 9 (WEST); clocks as sweet_sects.c.
++ * No rail is voted: the DT gives the touchscreen no supply (it is powered with
++ * the panel), and bramble's L17A is a fixed 1.8 V camera-sensor rail.
++ * On by default here (flametouch=0 turns it off); the redfin sec_ts driver
++ * stays off (sectouch=0).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -27,20 +36,20 @@ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_fts_init(void);
+ 
+-#define FTS_SE_PA       0x00890000u     /* spi@890000, QUPv3 0 SE4 */
+-#define FTS_GCC_PA      0x00100000u
+-#define FTS_SOUTH_PA    0x03d00000u     /* TLMM 0x3000000 + SOUTH tile */
+-#define FTS_GCC_VOTE    0x5200cu        /* APCS_CLOCK_BRANCH_ENA_VOTE_1 */
++#define FTS_SE_PA       0x00880000u     /* bramble: spi@880000, QUPv3 wrap0 SE0 */
++#define FTS_GCC_PA      0x00100000u     /* qcom,gcc@100000 */
++#define FTS_WEST_PA     0x0f500000u     /* TLMM 0xf000000 + WEST (pinctrl-lito.c) */
++#define FTS_EAST_PA     0x0f900000u     /* TLMM 0xf000000 + EAST */
++#define FTS_GCC_VOTE    0x52008u        /* APCS_CLOCK_BRANCH_ENA_VOTE_1 (lito) */
+ /* wrap0 m_ahb (6), s_ahb (7), core/core2x (8, 9), s4 (14): gcc-sm8150.c */
+-#define FTS_GCC_BITS    ((0xfu << 6) | (1u << 14))
+-#define FTS_RCG         0x17608u        /* gcc_qupv3_wrap0_s4_clk_src */
++#define FTS_GCC_BITS    (0x1fu << 6)    /* as sweet_sects.c ST_GCC_BITS */
++#define FTS_RCG         0x17010u        /* gcc_qupv3_wrap0_s0_clk_src */
+ #define FTS_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define FTS_GPIO_IO(n)  (FTS_GPIO_CFG(n) + 4u)
+-#define FTS_PIN_MISO    51              /* 51-54 = qup4 (function 1) */
+-#define FTS_PIN_IRQ     122
+-#define FTS_PIN_SWITCH  126             /* 0 = AP owns the bus, 1 = SLPI */
+-#define FTS_PIN_RESET   127
+-#define FTS_PIN_RATE    128             /* display refresh: 1 = 90 Hz */
++#define FTS_PIN_MISO    42              /* EAST 42-45 = qup00 (function 1) */
++#define FTS_PIN_IRQ     9               /* WEST; level low */
++#define FTS_PIN_SWITCH  35              /* EAST (tbn ap2lpi); 0 = AP owns the bus, 1 = SLPI */
++#define FTS_PIN_RESET   8               /* WEST */
+ #define FTS_MAX         10u
+ 
+ #define SE_STATUS       0x040u
+@@ -97,7 +106,7 @@ void sweet_fts_init(void);
+ #define FTS_EVT_ERROR   0xf3u
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, west, east;
+ 	bool started, dead;
+ 	int log;
+ 	unsigned fifo_words;
+@@ -145,16 +154,16 @@ fts_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 
+ /* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
+ static void
+-fts_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++fts_gpio(vm_offset_t tile, unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+ {
+ 	uint32_t off = FTS_GPIO_CFG(pin);
+ 	if (out) {
+-		fts_wr(ft.gpio, FTS_GPIO_IO(pin),
+-		    (fts_rd(ft.gpio, FTS_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		fts_wr(tile, FTS_GPIO_IO(pin),
++		    (fts_rd(tile, FTS_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+-	uint32_t cfg = fts_rd(ft.gpio, off) & ~0x3ffu;
++	uint32_t cfg = fts_rd(tile, off) & ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	fts_wr(ft.gpio, off, cfg);
++	fts_wr(tile, off, cfg);
+ }
+ 
+ static bool
+@@ -183,11 +192,11 @@ fts_clocks(void)
+ 		}
+ 	}
+ 	/*
+-	 * Branch halt bits: wrap0 m_ahb, s_ahb, s4. A branch under hardware
++	 * Branch halt bits: wrap0 m_ahb, s_ahb, s0 (lito). A branch under hardware
+ 	 * clock gating (bit 1) reads halted while idle; Linux skips the check
+ 	 * then (clk_branch_check_halt), so do the same.
+ 	 */
+-	const uint32_t branches[] = {0x17004, 0x17008, 0x17604};
++	const uint32_t branches[] = {0x17004, 0x17008, 0x1700c};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+ 		uint32_t cbcr = fts_rd(ft.gcc, branches[i]);
+ 		printf("SWEET FTS: GCC branch %#x = %#x\n", branches[i], cbcr);
+@@ -208,7 +217,7 @@ fts_se_init(void)
+ {
+ 	uint32_t fw = fts_rd(ft.se, SE_FW);
+ 	uint32_t tx = fts_rd(ft.se, SE_HW_TX), rx = fts_rd(ft.se, SE_HW_RX);
+-	printf("SWEET FTS: se4 fw=%#x proto=%u status=%#x fifo-off=%#x tx=%#x rx=%#x\n",
++	printf("SWEET FTS: se0 fw=%#x proto=%u status=%#x fifo-off=%#x tx=%#x rx=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, fts_rd(ft.se, SE_STATUS), fts_rd(ft.se, SE_FIFO_OFF), tx, rx);
+ 	/* Protocol 1 = SPI; 32-bit FIFO words. */
+ 	if (((fw >> 8) & 0xffu) != 1u || (fts_rd(ft.se, SE_FIFO_OFF) & 1u) ||
+@@ -218,7 +227,7 @@ fts_se_init(void)
+ 		return false;
+ 	}
+ 	if (fts_rd(ft.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET FTS: SE4 already busy; stopping\n");
++		printf("SWEET FTS: SE0 already busy; stopping\n");
+ 		return false;
+ 	}
+ 	ft.fifo_words = (tx >> 16) & 0x3fu;
+@@ -475,46 +484,42 @@ fts_thread(void *arg, wait_result_t result)
+ 	printf("SWEET FTS: starting in %u s\n", delay_s);
+ 	fts_wait(delay_s * 1000u);
+ 	ft.gcc = ml_io_map(FTS_GCC_PA, 0x60000);
+-	ft.gpio = ml_io_map(FTS_SOUTH_PA, 0x81000);
++	ft.west = ml_io_map(FTS_WEST_PA, FTS_GPIO_CFG(FTS_PIN_IRQ + 1));
++	ft.east = ml_io_map(FTS_EAST_PA, FTS_GPIO_CFG(FTS_PIN_MISO + 4));
+ 	ft.se = ml_io_map(FTS_SE_PA, 0x4000);
+-	if (!ft.gcc || !ft.gpio || !ft.se) {
++	if (!ft.gcc || !ft.west || !ft.east || !ft.se) {
+ 		printf("SWEET FTS: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+ 	printf("SWEET FTS: TLMM cfg/io miso=%#x/%#x irq=%#x/%#x switch=%#x/%#x reset=%#x/%#x\n",
+-	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_MISO)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_MISO)),
+-	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_IRQ)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)),
+-	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_SWITCH)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_SWITCH)),
+-	    fts_rd(ft.gpio, FTS_GPIO_CFG(FTS_PIN_RESET)), fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_RESET)));
+-	/* Hold the IC in reset while the rails come up (FTI: DVDD, then AVDD). */
+-	fts_gpio(FTS_PIN_RESET, 0, 0, 0, true, false);
+-	fts_gpio(FTS_PIN_IRQ, 0, 0, 0, false, false);
+-	fts_gpio(FTS_PIN_SWITCH, 0, 0, 0, true, false);
+-	fts_gpio(FTS_PIN_RATE, 0, 0, 0, true, false);
+-	int err = sweet_rpmh_vreg_enable("ldoa14", 1800);
+-	if (!err) {
+-		fts_wait(1);
+-		err = sweet_rpmh_vreg_enable("ldoa17", 2856);
+-	}
+-	if (err) {
+-		printf("SWEET FTS: rail enable failed %d; stopping\n", err);
+-		goto out;
+-	}
++	    fts_rd(ft.east, FTS_GPIO_CFG(FTS_PIN_MISO)), fts_rd(ft.east, FTS_GPIO_IO(FTS_PIN_MISO)),
++	    fts_rd(ft.west, FTS_GPIO_CFG(FTS_PIN_IRQ)), fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_IRQ)),
++	    fts_rd(ft.east, FTS_GPIO_CFG(FTS_PIN_SWITCH)), fts_rd(ft.east, FTS_GPIO_IO(FTS_PIN_SWITCH)),
++	    fts_rd(ft.west, FTS_GPIO_CFG(FTS_PIN_RESET)), fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_RESET)));
++	/*
++	 * bramble: hold the IC in reset, take the bus from the SLPI. No rail vote:
++	 * the touchscreen has no supply in the DT (it runs from the panel's rails,
++	 * which ABL leaves on for the splash screen).
++	 */
++	fts_gpio(ft.west, FTS_PIN_RESET, 0, 0, 0, true, false);
++	fts_gpio(ft.west, FTS_PIN_IRQ, 0, 0, 0, false, false);
++	fts_gpio(ft.east, FTS_PIN_SWITCH, 0, 0, 0, true, false);
++	int err;
+ 	fts_wait(5);
+ 	if (!fts_clocks()) {
+ 		goto out;
+ 	}
+ 	for (unsigned pin = FTS_PIN_MISO; pin < FTS_PIN_MISO + 4; ++pin) {
+-		fts_gpio(pin, 1, 0, 2, false, false); /* qup4, 6 mA, no pull */
++		fts_gpio(ft.east, pin, 1, 0, 3, false, false); /* qup00, 8 mA (DT ts_bus_active), no pull */
+ 	}
+ 	if (!fts_se_init()) {
+ 		goto out;
+ 	}
+ 	fts_wait(10);
+-	fts_gpio(FTS_PIN_RESET, 0, 0, 0, true, true);
++	fts_gpio(ft.west, FTS_PIN_RESET, 0, 0, 0, true, true);
+ 	err = fts_wait_event(FTS_EVT_READY, 1000);
+ 	printf("SWEET FTS: after reset pin: ready err=%d irq-pin=%u\n", err,
+-	    fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u);
++	    fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u);
+ 	uint8_t id[4] = {0};
+ 	int ierr = fts_reg_read(FTS_ADDR_CHIPID, id, sizeof(id));
+ 	printf("SWEET FTS: chip id err=%d %02x %02x fw %02x %02x (want 36 39)\n",
+@@ -544,7 +549,7 @@ fts_thread(void *arg, wait_result_t result)
+ 		/* The IRQ line (active low) says the FIFO holds events; also read
+ 		 * every ~100 ms in case the line does not work as assumed. */
+ 		bool poll = (++ticks % 12u) == 0;
+-		while ((poll || !(fts_rd(ft.gpio, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) && !ft.dead) {
++		while ((poll || !(fts_rd(ft.west, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) && !ft.dead) {
+ 			poll = false;
+ 			if (fts_event(ev)) {
+ 				if ((errors++ % 100u) == 0) {
+@@ -572,9 +577,8 @@ out:
+ void
+ sweet_fts_init(void)
+ {
+-	/* redfin: off unless asked. Its TLMM SOUTH address (0x03d00000) is the GPU
+-	 * on lito, so a forgotten flametouch=0 must not mean writes there. */
+-	int enabled = 0;
++	/* bramble (1201): on by default; the addresses above are lito's (bramble DT). */
++	int enabled = 1;
+ 	thread_t thread;
+ 	if (ft.started) {
+ 		return;
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -378,11 +378,13 @@ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+ 	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges;
+ 	 * redfin touch AVDD L17A fixed at 3304 mV (lito-redfin-touch.dtsi). */
++	/* bramble (1201): L17A is a fixed 1.8 V rail for the vd6281 camera sensor
++	 * (live DT regulator-pm8150-l17 1800000-1800000 uV): never 2856 or 3304 here. */
+ 	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
+ 	    (!strcmp(res, "ldoa14") && mv >= 1800 && mv <= 1840) ||
+-	    (!strcmp(res, "ldoa17") && ((mv >= 2856 && mv <= 3008) || mv == 3304)));
++	    (!strcmp(res, "ldoa17") && mv == 1800));
+ 	if (!ok) {
+ 		printf("SWEET RPMH: %s %u mV is not an allowed touch rail\n", res ? res : "?", mv);
+ 		return EINVAL;
